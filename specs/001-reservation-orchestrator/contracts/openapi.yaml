@@ -1,0 +1,520 @@
+openapi: 3.1.0
+info:
+  title: Reservation & Booking Orchestrator API
+  version: 0.1.0
+  description: |
+    HTTP contract for the reservation orchestrator (v1).
+    - Every state-changing endpoint requires an `Idempotency-Key` header (per constitution §IV).
+    - Authentication: OAuth 2.1 / OIDC. Partner clients use client-credentials bearer JWT;
+      the first-party SPA uses the BFF pattern (session cookie backed by auth-code + PKCE).
+    - Refund endpoints require the `payments:refund:approve` scope for approval / revoke;
+      `reservations:write` gates all other state-changing operations.
+servers:
+  - url: /api
+security:
+  - oauth2: []
+  - sessionCookie: []
+tags:
+  - name: search
+  - name: reservations
+  - name: refunds
+  - name: system
+
+paths:
+  /livez:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200": { description: OK }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness probe
+      security: []
+      responses:
+        "200": { description: OK }
+        "503": { description: Not ready }
+
+  /search:
+    post:
+      tags: [search]
+      summary: Search flights, rooms, or bundles and receive priced offers
+      operationId: search
+      parameters:
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: Offers returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /reservations:
+    post:
+      tags: [reservations]
+      summary: Place a 15-minute hold on an offer
+      operationId: placeHold
+      security:
+        - oauth2: [reservations:write]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaceHoldRequest" }
+      responses:
+        "201":
+          description: Hold placed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "410":
+          description: Offer expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /reservations/{reservation_id}:
+    get:
+      tags: [reservations]
+      summary: Get a reservation
+      operationId: getReservation
+      parameters:
+        - $ref: "#/components/parameters/ReservationId"
+      responses:
+        "200":
+          description: Found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /reservations/{reservation_id}/pay:
+    post:
+      tags: [reservations]
+      summary: Authorize payment for a held reservation
+      operationId: payReservation
+      security:
+        - oauth2: [reservations:write]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PayRequest" }
+      responses:
+        "200":
+          description: Payment authorized (or terminal CANCELLED_PAYMENT_FAILED on FR-015a timeout)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /reservations/{reservation_id}/confirm:
+    post:
+      tags: [reservations]
+      summary: Capture payment and confirm the booking
+      operationId: confirmReservation
+      security:
+        - oauth2: [reservations:write]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      responses:
+        "200":
+          description: Confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /reservations/{reservation_id}/cancel:
+    post:
+      tags: [reservations]
+      summary: Cancel a reservation (per FR-018a room / FR-018b flight policy)
+      operationId: cancelReservation
+      security:
+        - oauth2: [reservations:write]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelRequest" }
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /reservations/{reservation_id}/refunds:
+    post:
+      tags: [refunds]
+      summary: Request a refund on a confirmed reservation
+      operationId: requestRefund
+      security:
+        - oauth2: [reservations:write]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefundRequest" }
+      responses:
+        "201":
+          description: Refund requested (state = REQUESTED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refund" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /refunds:
+    get:
+      tags: [refunds]
+      summary: List refunds (approver queue)
+      operationId: listRefunds
+      security:
+        - oauth2: [payments:refund:approve]
+        - sessionCookie: []
+      parameters:
+        - in: query
+          name: state
+          schema: { $ref: "#/components/schemas/RefundState" }
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+      responses:
+        "200":
+          description: Page of refunds
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefundPage" }
+
+  /refunds/{refund_id}/approve:
+    post:
+      tags: [refunds]
+      summary: Approve a refund (four-eyes gate — approver must differ from requester)
+      operationId: approveRefund
+      security:
+        - oauth2: [payments:refund:approve]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RefundId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      responses:
+        "200":
+          description: Approved (state → APPROVED, then EXECUTED on adapter success)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refund" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Approver is the same subject as the requester
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /refunds/{refund_id}/revoke:
+    post:
+      tags: [refunds]
+      summary: Revoke a refund before execution
+      operationId: revokeRefund
+      security:
+        - oauth2: [payments:refund:approve]
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RefundId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refund" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      description: OAuth 2.1 / OIDC via the configured issuer (Keycloak in dev).
+      flows:
+        clientCredentials:
+          tokenUrl: https://idp.example.com/realms/rbo/protocol/openid-connect/token
+          scopes:
+            reservations:write: Create / mutate reservations (hold, pay, confirm, cancel, request refund)
+            payments:refund:approve: Approve or revoke refund requests (four-eyes gate)
+        authorizationCode:
+          authorizationUrl: https://idp.example.com/realms/rbo/protocol/openid-connect/auth
+          tokenUrl: https://idp.example.com/realms/rbo/protocol/openid-connect/token
+          scopes:
+            reservations:write: Create / mutate reservations (hold, pay, confirm, cancel, request refund)
+            payments:refund:approve: Approve or revoke refund requests (four-eyes gate)
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: rbo_session
+      description: BFF session cookie issued after OAuth 2.1 auth-code + PKCE login.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 128 }
+      description: Client-supplied dedup key (24 h window).
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+    ReservationId:
+      name: reservation_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 26, maxLength: 26 }
+    RefundId:
+      name: refund_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 26, maxLength: 26 }
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing / invalid credentials
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: Illegal state transition or duplicate Idempotency-Key with a different body
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    UnprocessableEntity:
+      description: Request valid but semantically rejected
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: { type: string, description: "Decimal string, 2 dp for USD" }
+        currency: { type: string, minLength: 3, maxLength: 3, description: "ISO 4217" }
+    ProductKind:
+      type: string
+      enum: [FLIGHT, ROOM, BUNDLE]
+    LoyaltyTier:
+      type: string
+      enum: [NONE, SILVER, GOLD, PLATINUM]
+    ReservationState:
+      type: string
+      enum:
+        - HOLD_PENDING
+        - HOLD_FAILED
+        - HELD
+        - PAY_PENDING
+        - PAY_AUTHORIZED
+        - CONFIRMED
+        - CANCELLED_USER
+        - CANCELLED_HOLD_EXPIRED
+        - CANCELLED_PAYMENT_FAILED
+        - REFUND_PENDING
+        - REFUNDED
+    RefundState:
+      type: string
+      enum: [REQUESTED, APPROVED, EXECUTED, REVOKED, FAILED]
+    RefundPolicyCode:
+      type: string
+      enum:
+        - ROOM_48H_FULL
+        - ROOM_48H_ZERO
+        - FLIGHT_PROVIDER_TERMS
+        - DISCRETIONARY
+
+    SearchRequest:
+      type: object
+      required: [product_kind, start_at, end_at, pax]
+      properties:
+        product_kind: { $ref: "#/components/schemas/ProductKind" }
+        origin: { type: string, nullable: true }
+        destination: { type: string, nullable: true }
+        property_id: { type: string, nullable: true }
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        pax: { type: integer, minimum: 1 }
+        loyalty_tier: { $ref: "#/components/schemas/LoyaltyTier" }
+        currency: { type: string, default: "USD" }
+    Offer:
+      type: object
+      required: [offer_id, product_kind, base_price, total_price, expires_at]
+      properties:
+        offer_id: { type: string }
+        product_kind: { $ref: "#/components/schemas/ProductKind" }
+        provider_ref: { type: string }
+        base_price: { $ref: "#/components/schemas/Money" }
+        total_price: { $ref: "#/components/schemas/Money" }
+        rule_trace:
+          type: array
+          items:
+            type: object
+            required: [rule_id, delta]
+            properties:
+              rule_id: { type: string }
+              delta: { $ref: "#/components/schemas/Money" }
+              reason: { type: string }
+        expires_at: { type: string, format: date-time }
+    SearchResponse:
+      type: object
+      required: [query_id, offers]
+      properties:
+        query_id: { type: string }
+        offers:
+          type: array
+          items: { $ref: "#/components/schemas/Offer" }
+
+    PlaceHoldRequest:
+      type: object
+      required: [offer_id]
+      properties:
+        offer_id: { type: string }
+    PayRequest:
+      type: object
+      required: [payment_token]
+      properties:
+        payment_token: { type: string, description: "Tokenized PSP instrument" }
+    CancelRequest:
+      type: object
+      properties:
+        reason: { type: string }
+    RefundRequest:
+      type: object
+      description: |
+        Caller supplies only a free-text `reason` (audit justification).
+        The refund `amount` and `policy_code` are computed server-side per
+        FR-018 / FR-018a (RoomCancellationPolicy) / FR-018b (FlightRefundPolicy)
+        and returned on the Refund response.
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 1024 }
+
+    Reservation:
+      type: object
+      required: [reservation_id, user_sub, offer_id, state, total_price, created_at, updated_at, version]
+      properties:
+        reservation_id: { type: string }
+        user_sub: { type: string }
+        offer_id: { type: string }
+        state: { $ref: "#/components/schemas/ReservationState" }
+        hold_id: { type: string, nullable: true }
+        payment_id: { type: string, nullable: true }
+        total_price: { $ref: "#/components/schemas/Money" }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        version: { type: integer }
+    Refund:
+      type: object
+      required: [refund_id, reservation_id, payment_id, amount, state, policy_code, requested_by_sub, requested_at]
+      properties:
+        refund_id: { type: string }
+        reservation_id: { type: string }
+        payment_id: { type: string }
+        amount: { $ref: "#/components/schemas/Money" }
+        state: { $ref: "#/components/schemas/RefundState" }
+        policy_code: { $ref: "#/components/schemas/RefundPolicyCode" }
+        requested_by_sub: { type: string }
+        approved_by_sub: { type: string, nullable: true }
+        psp_refund_ref: { type: string, nullable: true }
+        failure_reason: { type: string, nullable: true }
+        requested_at: { type: string, format: date-time }
+        approved_at: { type: string, format: date-time, nullable: true }
+        executed_at: { type: string, format: date-time, nullable: true }
+    RefundPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Refund" }
+        next_cursor: { type: string, nullable: true }
+
+    Problem:
+      type: object
+      description: RFC 7807 problem detail
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        correlation_id: { type: string }
